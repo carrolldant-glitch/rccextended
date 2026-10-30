@@ -1,0 +1,33 @@
+LICENSING CLARIFIED — LOCAL RELEASE REVIEW STILL REQUIRED
+
+Reviewed upstream tag: v1.0.6
+Commit: 0160038dd0b2d1e0b501dbeea46ec1dfcd09ae6e
+Repository: https://github.com/zedxxx/rccextended
+
+SPDX: GPL-3.0-only WITH Qt-GPL-exception-1.0
+
+On 2026-10-29, upstream author zedxxx confirmed this license for the combined
+work and added license files, six SPDX source/header notices and README sections:
+https://github.com/zedxxx/rccextended/issues/6#issuecomment-6508472757
+https://github.com/zedxxx/rccextended/commit/eea2824a1a602a89d9270fc64020a735584958ce
+
+The v1.0.6 tag predates those notices. This recipe applies that exact, SHA-256
+pinned licensing commit as a patch before the downstream repair. LICENSE holds
+GPL version 3; LICENSE.GPL3-EXCEPT holds the Qt exception. Both are installed.
+The original Qt/Intel and added zed notices are preserved. This uses the GPL
+alternative; it does not grant or imply any commercial Qt license rights.
+
+Original downstream additions in resource-safety.patch, check.py, PKGBUILD,
+.SRCINFO, .gitignore, README.arch, this file and changes.md use the same SPDX
+license expression above. Existing third-party notices remain in force; this
+does not claim ownership of upstream code. Downstream modification date:
+2026-10-29. The patch and changes.md identify this as a modified version.
+
+Before distributing binaries, provide the corresponding source, including the
+pinned upstream source, licensing patch, downstream repair and build recipe,
+along with the required notices. This package does not authorize redistribution
+of third-party resources someone might extract using the program.
+
+The earlier LicenseRef-Upstream-Unspecified marker is removed. Licensing
+clarification is not verification or release approval: Danny's review, three
+clean-chroot passes and explicit publication approval are still required.

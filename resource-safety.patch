@@ -1,0 +1,1127 @@
+SPDX-License-Identifier: GPL-3.0-only WITH Qt-GPL-exception-1.0
+Downstream repair for Danny's Arch package, 2026-10-29; see changes.md.
+Applies after upstream's eea2824a license-notice backport.
+
+--- a/src/logger.cpp
++++ b/src/logger.cpp
+@@ -21,6 +21,9 @@
+ 
+     if (isOk_) {
+         defaultMessageHandler_ = qInstallMessageHandler(Logger::messageHandler);
++    } else {
++        delete logFile_;
++        logFile_ = nullptr;
+     }
+ }
+ 
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -232,31 +232,32 @@
+     parser.process(app);
+ 
+     if (parser.isSet(reverseOption)) {
+-        QString mask;
+-        if (argc == 3) {
+-            // optional mask or file name provided
+-            mask = argv[2];
+-        }
+-        if (mask.isEmpty()) {
+-            mask = "*.rcc";
+-        }
+-
++        QStringList inputs = parser.positionalArguments();
++        if (inputs.isEmpty())
++            inputs.append("*.rcc");
+         QStringList files;
+-        if (mask.contains("*")) {
+-            qInfo("Processing files by mask: '%s'", qPrintable(mask));
+-            files = QDir(QLatin1String("./")).entryList(QStringList(mask), QDir::Files);
+-        } else if (QFile::exists(mask)) {
+-            // single file
+-            files.append(mask);
++        for (const QString &input : inputs) {
++            if (QFileInfo(input).isFile()) {
++                files.append(input);
++                continue;
++            }
++            const QFileInfo pattern(input);
++            const QDir directory(pattern.path());
++            const QStringList matches = directory.entryList({pattern.fileName()},
++                                                            QDir::Files | QDir::Hidden);
++            if (matches.isEmpty()) {
++                qWarning() << "ERROR: No input matches:" << input;
++                return 1;
++            }
++            for (const QString &match : matches)
++                files.append(directory.filePath(match));
+         }
+-
+-        RccReverse().run(files);
+-        return 0;
++        return RccReverse().run(files) ? 0 : 1;
+     }
+ 
+     QString errorMsg;
+ 
+-    quint8 formatVersion = 3;
++    uint formatVersion = 3;
+     if (parser.isSet(formatVersionOption)) {
+         bool ok = false;
+         formatVersion = parser.value(formatVersionOption).toUInt(&ok);
+@@ -451,7 +452,7 @@
+         }
+     }
+     bool success = library.output(out, temp, errorDevice);
+-    if (!success) {
++    if (!success || !out.flush()) {
+         // erase the output file if we failed
+         out.remove();
+         return 1;
+--- a/src/rcc.cpp
++++ b/src/rcc.cpp
+@@ -976,8 +976,7 @@
+         m_errorDevice->write("Could not write footer\n");
+         return false;
+     }
+-    outDevice.write(m_out.constData(), m_out.size());
+-    return true;
++    return outDevice.write(m_out.constData(), m_out.size()) == m_out.size();
+ }
+ 
+ void RCCResourceLibrary::writeDecimal(int value)
+--- a/src/rcc.pro
++++ b/src/rcc.pro
+@@ -4,7 +4,6 @@
+ TARGET = rcc
+ 
+ CONFIG += console
+-CONFIG += static
+ CONFIG -= app_bundle
+ CONFIG += release
+ 
+@@ -12,10 +11,9 @@
+ 
+ DEFINES += QT_RCC QT_NO_FOREACH
+ DEFINES += QT_FEATURE_zstd=1
+-DEFINES += STATIC
+ 
+ contains(DEFINES, QT_FEATURE_zstd=1) {
+-    LIBS += -lzstd
++    LIBS += -lzstd -lz
+ }
+ 
+ SOURCES += \
+--- a/src/rccreverse.cpp
++++ b/src/rccreverse.cpp
+@@ -1,306 +1,152 @@
+ // SPDX-License-Identifier: GPL-3.0-only WITH Qt-GPL-exception-1.0
+ // Copyright (c) 2020 zed
+ 
++#include <QCoreApplication>
+ #include <QDebug>
+-#include <QResource>
++#include <QDir>
+ #include <QFile>
+-#include <QTextStream>
++#include <QFileInfo>
++#include <QLocale>
++#include <QSet>
++#include <QTemporaryDir>
++#include <QXmlStreamWriter>
+ 
+ #include "logger.h"
+ #include "rccreverse.h"
++#include "resinfo.h"
+ 
+-static const QString rootPath("./qresource/");
+-static const QString resPath(rootPath + "res/");
+-static const QString qrcPath(rootPath + "qrc/");
+-static const QString scriptPath(rootPath + "rcc/");
+-
+-static bool mkpath(const QString &path)
+-{
+-    bool ret = QDir("./").mkpath(path);
+-
+-    if (!ret)
+-        qInfo() << "ERROR: Can't create folder:" << path;
+-
+-    return ret;
+-}
+-
+-RccReverse::RccReverse()
+-{
+-    m_currLocale = QLocale::system();
+-}
+-
+-void RccReverse::run(const QStringList &listFiles)
++static bool writeFile(const QString &name, const QByteArray &data)
+ {
+-    if (listFiles.isEmpty()) {
+-        qInfo() << "ERROR: No input files!";
+-        return;
+-    }
+-
+-    if (!mkpath(rootPath) || !mkpath(resPath) || !mkpath(qrcPath) || !mkpath(scriptPath) )
+-        return;
+-
+-    Logger logger(rootPath + "log.txt");
+-
+-    for (const QString &rccFileName : listFiles) {
+-        qInfo() << "Processing file:" << rccFileName;
+-
+-        m_files.clear();
+-
+-        if (!m_resInfo.read(rccFileName)) {
+-            qInfo() << "WARNING: Only resources for the default/system locale will be extracted";
++    QFile file(name);
++    if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly)
++            || file.write(data) != data.size() || !file.flush()) {
++        qWarning() << "ERROR: Cannot save:" << name << file.errorString();
++        return false;
++    }
++    return true;
++}
++
++static QString shellQuote(QString value)
++{
++    return "'" + value.replace("'", "'\\''") + "'";
++}
++
++static QString localeName(const ResItem &item)
++{
++    if (item.language == QLocale::C && item.country == QLocale::AnyCountry)
++        return {};
++    const QLocale locale(QLocale::Language(item.language), QLocale::Country(item.country));
++    const QString name = locale.name();
++    // RCC uses a two-letter language with no country as the wildcard locale.
++    if (item.country == QLocale::AnyCountry)
++        return name.section('_', 0, 0);
++    return name;
++}
++
++bool RccReverse::run(const QStringList &listFiles)
++{
++    if (listFiles.isEmpty() || listFiles.size() > 10000) {
++        qWarning() << "ERROR: Expected between 1 and 10000 input files";
++        return false;
++    }
++    if (QFileInfo::exists("qresource") || QFileInfo("qresource").isSymLink()) {
++        qWarning() << "ERROR: qresource already exists; use a fresh working directory";
++        return false;
++    }
++    QTemporaryDir stage("./.rccextended-XXXXXX");
++    if (!stage.isValid())
++        return false;
++    const QString root = stage.path() + "/";
++    if (!QDir().mkpath(root + "res") || !QDir().mkpath(root + "qrc")
++            || !QDir().mkpath(root + "rcc"))
++        return false;
++    Logger logger(root + "log.txt");
++    QSet<QString> bundles;
++    qint64 totalBytes = 0;
++    int totalNodes = 0;
++    QString script = "#!/bin/sh\n# Resource names are literal, never shell expansions.\n"
++                     "# shellcheck disable=SC2016\nset -eu\ncd -- \"$(dirname -- \"$0\")\"\n";
++    for (const QString &input : listFiles) {
++        const QString bundle = QFileInfo(input).fileName();
++        if (bundle.isEmpty() || bundles.contains(bundle)) {
++            qWarning() << "ERROR: Duplicate or empty input basename:" << bundle;
++            return false;
+         }
+-
+-        updateLocale();
+-
+-        QResource rcc;
+-
+-        if (!rcc.registerResource(rccFileName)) {
+-            qInfo() << "ERROR: Can't load:" << rccFileName;
+-            qInfo() << "This may be because your version of Qt doesn't support this qres version";
+-            continue;
++        bundles.insert(bundle);
++        ResInfo info;
++        if (!info.read(input)) {
++            qWarning() << "ERROR: Invalid or unsupported resource:" << input;
++            return false;
+         }
+-
+-        QString name = QFileInfo(rccFileName).fileName();
+-
+-        extractResourses(QDir(":/"), resPath + name + "/");
+-
+-        rcc.unregisterResource(rccFileName);
+-
+-        qrcSave(rccFileName);
+-        scriptWrite(rccFileName);
+-    }
+-
+-    scriptSave();
+-}
+-
+-void RccReverse::extractResourses(const QDir &dir, const QString &destPath)
+-{
+-    if (!mkpath(destPath))
+-        return;
+-
+-    dir.addSearchPath(":", dir.path());
+-
+-    // process files
+-    const QStringList listFiles = dir.entryList(QDir::Files);
+-
+-    for (const QString &resFile : listFiles) {
+-
+-        const QString srcFileName(dir.absoluteFilePath(resFile));
+-         QString destFileName(destPath + resFile);
+-
+-        const QList<ResItem> info = m_resInfo.getInfo(srcFileName);
+-
+-        if (info.isEmpty()) {
+-            qInfo() << "Found resource file:" << srcFileName;
+-            updateLocale();
+-            extractFile(srcFileName, destFileName, "");
+-        } else {
+-            for (const ResItem &item : info) {
+-
+-                QLocale locale(QLocale::Language(item.language),
+-                               QLocale::Country(item.country));
+-
+-                bool nameOk = (locale.country() == QLocale::AnyCountry) &&
+-                              (locale.language() == QLocale::AnyLanguage || locale.language() == QLocale::C);
+-
+-                QString dest;
+-                QString lang("");
+-
+-                if (nameOk) {
+-                    qInfo() << "Found resource file:" << srcFileName;
+-                    dest = destFileName;
+-                } else {
+-                    qInfo() << "Found resource file:" << srcFileName << locale;
+-                    lang = locale.bcp47Name();
+-
+-                    QString path(destPath + lang + "/");
+-                    if (!mkpath(path)) {
+-                        continue;
+-                    }
+-                    dest = path + resFile;
++        if (info.nodeCount() > 10000 - totalNodes) {
++            qWarning() << "ERROR: Batch tree-node limit exceeded";
++            return false;
++        }
++        totalNodes += info.nodeCount();
++        QByteArray document;
++        QXmlStreamWriter xml(&document);
++        xml.setAutoFormatting(true);
++        xml.writeStartDocument();
++        xml.writeStartElement("RCC");
++        xml.writeAttribute("version", "1.0");
++        for (const QString &name : info.getItemNames()) {
++            const QString alias = name.mid(2); // validated :/ path components
++            for (const ResItem &item : info.getInfo(name)) {
++                const qint64 size = info.dataSize(item);
++                // ponytail: 256 MiB output per invocation; streaming/explicit
++                // user-selected limits are needed before accepting larger sets.
++                if (size < 0 || size > 256 * 1024 * 1024 - totalBytes) {
++                    qWarning() << "ERROR: Expanded resource limit exceeded";
++                    return false;
+                 }
+-
+-                updateLocale(locale);
+-                extractFile(srcFileName, dest, lang);
++                totalBytes += size;
++                const QString relative = "res/" + bundle + "/"
++                        + QString::number(item.language) + "_"
++                        + QString::number(item.country) + "/" + alias;
++                QByteArray data;
++                if (!info.readData(item, data)) {
++                    qWarning() << "ERROR: Invalid compressed payload:" << name;
++                    return false;
++                }
++                const QString output = root + relative;
++                if (!QDir().mkpath(QFileInfo(output).path()) || !writeFile(output, data))
++                    return false;
++                const QString lang = localeName(item);
++                // Do not silently turn unsupported wildcard locales into a
++                // country-specific locale when writing the rebuild project.
++                if (item.country == QLocale::AnyCountry && item.language != QLocale::C
++                        && lang.size() != 2) {
++                    qWarning() << "ERROR: Locale cannot round-trip through Qt 5 QRC:" << lang;
++                    return false;
++                }
++                xml.writeStartElement("qresource");
++                if (!lang.isEmpty())
++                    xml.writeAttribute("lang", lang);
++                xml.writeStartElement("file");
++                xml.writeAttribute("alias", alias);
++                xml.writeCharacters("../" + relative);
++                xml.writeEndElement();
++                xml.writeEndElement();
+             }
+         }
+-    }
+-
+-    // process subfolders (recursion)
+-    const QStringList listDirs = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+-
+-    for (const QString &resDir : listDirs) {
+-        // qInfo() << "Found resource folder:" << resDir;
+-        QDir subDir = dir.path() + (dir.path() == ":/" ? "" : "/") + resDir;
+-        extractResourses(subDir, destPath + resDir + "/");
+-    }
+-}
+-
+-void RccReverse::extractFile(const QString &fileName, const QString &outFileName, const QString &lang)
+-{
+-    const QString uniqueFileName = getUniqueFileName(outFileName);
+-
+-    qrcWrite(fileName, uniqueFileName, lang);
+-
+-    if (QFile::exists(uniqueFileName)) {
+-        qInfo() << "File already exists:" << uniqueFileName;
+-        return;
+-    }
+-
+-    if (QFile::copy(fileName, uniqueFileName)) {
+-        qInfo() << "File extracted to:" << uniqueFileName;
+-        // We need to set the permissions (644) as they are read only by default
+-        if (!QFile::setPermissions(uniqueFileName, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ReadGroup | QFileDevice::ReadOther)) {
+-            qInfo() << "WARNING: Can't set permissions for:" << uniqueFileName;
+-        }
+-    } else {
+-        qInfo() << "ERROR: Can't save file to:" << uniqueFileName;
+-    }
+-}
+-
+-const QString RccReverse::getUniqueFileName(const QString &fileName)
+-{
+-    #ifdef Q_OS_WIN
+-    QString storedName(fileName.toLower());
+-    #else
+-    QString storedName(fileName);
+-    #endif
+-
+-    if (!m_files.contains(storedName)) {
+-        m_files.insert(storedName, 1);
+-
+-        return fileName;
+-    }
+-
+-    qInfo() << "WARNING: File name collision detected:" << fileName;
+-
+-    int count = m_files.value(storedName);
+-
+-    QFileInfo finfo(fileName);
+-
+-    QString newName = finfo.path() + "/" +
+-                      finfo.baseName() + "_(" + QString::number(count) + ")" + "." +
+-                      finfo.completeSuffix();
+-
+-    #ifdef Q_OS_WIN
+-    QString newStoredName(newName.toLower());
+-    #else
+-    QString newStoredName(newName);
+-    #endif
+-
+-    if (!m_files.contains(newStoredName)) {
+-        m_files.insert(storedName, count+1);
+-        m_files.insert(newStoredName, 1);
+-
+-        qInfo() << "INFO: File name collision resolved:" << newName;
+-
+-        return newName;
+-    }
+-
+-    // recursion
+-    return getUniqueFileName(newName);
+-}
+-
+-void RccReverse::qrcWrite(const QString &resFileName, const QString &outFileName, const QString &lang)
+-{
+-    QString aliasName(resFileName);
+-    aliasName.replace(":/", "");
+-
+-    QString fileName(outFileName);
+-    fileName.replace(rootPath, "./../");
+-
+-    const QString alias = "<file alias=\"" + aliasName + "\">" + fileName + "</file>\n";
+-
+-    if (!lang.isEmpty()) {
+-        m_qrc = m_qrc +
+-                "<qresource lang=\"" + lang + "\">" + "\n" +
+-                "    " + alias +
+-                "</qresource>" + "\n";
+-    } else {
+-        m_qrc = m_qrc +
+-                "<qresource>" + "\n" +
+-                "    " + alias +
+-                "</qresource>" + "\n";
+-    }
+-}
+-
+-void RccReverse::qrcSave(const QString &rccFileName)
+-{
+-    if (m_qrc.isEmpty())
+-        return;
+-
+-    QString fileName = QFileInfo(rccFileName).baseName();
+-
+-    QFile file(qrcPath + fileName + ".qrc");
+-    if ( file.open(QIODevice::WriteOnly) ) {
+-        QTextStream stream(&file);
+-
+-        stream << "<!DOCTYPE RCC><RCC version=\"1.0\">" << "\n"
+-               <<  m_qrc               
+-               << "</RCC>" << "\n";
+-
+-        file.close();
+-    }
+-
+-    m_qrc.clear();
+-}
+-
+-void RccReverse::scriptWrite(const QString &rccFileName)
+-{
+-    QString fileName = QFileInfo(rccFileName).baseName();
+-
+-    QString fileExt = QFileInfo(rccFileName).suffix();
+-    if (fileExt.isEmpty()) {
+-        fileExt = "rcc";
+-    }
+-
+-    #ifdef Q_OS_WIN
+-    m_bat = m_bat + "%rcc% %opt% ./../qrc/" + fileName + ".qrc" + " -o ./../rcc/" + fileName + "." + fileExt + "\r\n";
+-    #else
+-    m_bat = m_bat + "rcc ${opt} ./../qrc/" + fileName + ".qrc" + " -o ./../rcc/" + fileName + "." + fileExt + "\n";
+-    #endif
+-}
+-
+-void RccReverse::scriptSave()
+-{
+-    if (m_bat.isEmpty())
+-        return;
+-
+-    #ifdef Q_OS_WIN
+-      auto ext = ".bat";
+-    #else
+-      auto ext = ".sh";
+-    #endif
+-
+-    QFile file(scriptPath + "rcc-make" + ext);
+-    if (file.open(QIODevice::WriteOnly)) {
+-        QTextStream stream(&file);
+-
+-        auto opt = "--verbose --compress-algo zlib --format-version 1 --binary";
+-
+-        #ifdef Q_OS_WIN
+-        stream << "@echo off" << "\r\n" << "\r\n"
+-               << "set rcc=rcc.exe" << "\r\n"
+-               << "set opt=" << opt << "\r\n" << "\r\n";
+-        #else
+-        stream << "#!/usr/bin/bash" << "\n\n"
+-               << "opt=" << opt << "\n\n";
+-        #endif
+-
+-        stream << m_bat;
+-
+-        #ifdef Q_OS_WIN
+-        stream << "\r\n" << "pause" << "\r\n";
+-        #endif
+-
+-        file.close();
+-    }
+-}
+-
+-void RccReverse::updateLocale(const QLocale &locale)
+-{
+-    if (m_currLocale != locale) {
+-        QLocale::setDefault(locale);
+-        m_currLocale = locale;
+-    }
++        xml.writeEndElement();
++        xml.writeEndDocument();
++        if (xml.hasError() || !writeFile(root + "qrc/" + bundle + ".qrc", document))
++            return false;
++        script += "rccextended --binary --compress-algo zlib --format-version "
++                + QString::number(info.getFormatVersion()) + " "
++                + shellQuote("../qrc/" + bundle + ".qrc") + " -o "
++                + shellQuote("./" + bundle) + "\n";
++    }
++    if (!writeFile(root + "rcc/rcc-make.sh", script.toUtf8()))
++        return false;
++    // The private tree contains only validated names and files we created.
++    // Failures discard only that tree; an existing user destination is untouched.
++    if (!QDir().rename(stage.path(), "qresource")) {
++        qWarning() << "ERROR: Cannot publish extraction into qresource";
++        return false;
++    }
++    stage.setAutoRemove(false);
++    qInfo() << "Extracted into qresource; rebuild with: sh qresource/rcc/rcc-make.sh";
++    return true;
+ }
+--- a/src/rccreverse.h
++++ b/src/rccreverse.h
+@@ -1,44 +1,15 @@
+ // SPDX-License-Identifier: GPL-3.0-only WITH Qt-GPL-exception-1.0
+ // Copyright (c) 2020 zed
+ 
+ #ifndef RCCREVERSE_H
+ #define RCCREVERSE_H
+ 
+-#include <QDir>
+-#include <QHash>
+-#include <QLocale>
+-#include <QString>
+-#include <QResource>
+-
+-#include "resinfo.h"
++#include <QStringList>
+ 
+ class RccReverse
+ {
+ public:
+-    RccReverse();
+-    void run(const QStringList &listFiles);
+-
+-private:
+-    ResInfo m_resInfo;
+-    QHash<QString, int> m_files;
+-
+-    QString m_qrc;
+-    QString m_bat;
+-
+-    QLocale m_currLocale;
+-
+-    void extractResourses(const QDir &dir, const QString &path);
+-    void extractFile(const QString &fileName, const QString &outFileName, const QString &lang);
+-
+-    const QString getUniqueFileName(const QString &fileName);
+-
+-    void qrcWrite(const QString &resFileName, const QString &outFileName, const QString &lang);
+-    void qrcSave(const QString &rccFileName);
+-
+-    void scriptWrite(const QString &rccFileName);
+-    void scriptSave();
+-
+-    void updateLocale(const QLocale &locale = QLocale::system());
++    bool run(const QStringList &listFiles);
+ };
+ 
+-#endif // RCCREVERSE_H
++#endif
+--- a/src/resinfo.cpp
++++ b/src/resinfo.cpp
+@@ -1,263 +1,180 @@
+ // SPDX-License-Identifier: GPL-3.0-only WITH Qt-GPL-exception-1.0
+ // Copyright (c) 2020 zed
+ 
+ #include <QDebug>
++#include <QFile>
++#include <QFileInfo>
++#include <QLocale>
+ #include <QtEndian>
++#include <zlib.h>
++#include <zstd.h>
+ 
+ #include "resinfo.h"
+ 
+-static const char *LOG_MESSAGE_ID = "[ResInfo]";
+-
+-ResInfo::ResInfo()
+-{
+-
+-}
+-
+-ResInfo::~ResInfo()
+-{
+-    clear();
+-}
+-
+-QList<ResItem> ResInfo::getInfo(const QString &itemName) const
+-{
+-    QList<ResItem> list = m_info.values(itemName);
+-
+-    // reverse list to return items in the insertion order
+-    for(int i = 0, j = list.size(), max = j/2; i < max; i++)
+-         list.swapItemsAt(i, j - 1 - i);
+-
+-    return list;
+-}
+-
+-const QList<QString> ResInfo::getItemNames() const
++static bool inRange(qint64 offset, qint64 size, qint64 length)
+ {
+-    return m_orderedItemNames;
++    return offset >= 0 && size >= 0 && offset <= length && size <= length - offset;
+ }
+ 
+-int ResInfo::getFormatVersion() const
+-{
+-    return m_formatVersion;
+-}
+-
+-int ResInfo::getFlags() const
+-{
+-    return m_flags;
+-}
+-
+-int ResInfo::getItemsCount() const
+-{
+-    return m_info.size();
+-}
+-
+-void ResInfo::clear()
++bool ResInfo::read(const QString &fileName)
+ {
+     m_info.clear();
+     m_orderedItemNames.clear();
+-
+-    if (m_data)
+-        delete [] m_data;
+-
+-    m_data = nullptr;
+-    m_data_len = 0;
+-
+-    m_formatVersion = 0;
+-    m_flags = 0;
+-    m_tree = nullptr;
+-    m_names = nullptr;
+-    m_payloads = nullptr;
+-}
+-
+-bool ResInfo::read(const QString &fileName)
+-{
+-    clear();
+-
+-    if (fileName.isEmpty()) {
+-        qInfo() << LOG_MESSAGE_ID << "File name is empty!";
++    m_directories.clear();
++    m_data.clear();
++    QFile file(fileName);
++    if (!QFileInfo(file).isFile() || !file.open(QIODevice::ReadOnly)
++            || file.size() < 20 || file.size() > MaxBytes) {
++        qWarning() << "ERROR: Not a readable regular RCC file of at most 64 MiB:" << fileName;
+         return false;
+     }
+-
+-    if (!parseHeader(fileName))
++    m_data = file.read(MaxBytes + 1);
++    if (m_data.size() != file.size() || m_data.size() < 20 || m_data.size() > MaxBytes
++            || file.error() != QFileDevice::NoError || !m_data.startsWith("qres"))
+         return false;
+ 
+-    return parseTree("", 0);
++    const char *p = m_data.constData();
++    m_formatVersion = qFromBigEndian<qint32>(p + 4);
++    const int headerSize = m_formatVersion == 3 ? 24 : 20;
++    if (m_formatVersion < 1 || m_formatVersion > 3 || m_data.size() < headerSize)
++        return false;
++    if (m_formatVersion == 3 && (qFromBigEndian<quint32>(p + 20) & ~quint32(5)))
++        return false;
++    m_treeOffset = qFromBigEndian<qint32>(p + 8);
++    m_dataOffset = qFromBigEndian<qint32>(p + 12);
++    m_namesOffset = qFromBigEndian<qint32>(p + 16);
++    // RCC writes the header, payloads, names, then fixed-size tree records.
++    if (m_dataOffset < headerSize || m_namesOffset < m_dataOffset
++            || m_treeOffset < m_namesOffset || m_treeOffset > m_data.size())
++        return false;
++    m_nodeSize = m_formatVersion == 1 ? 14 : 22;
++    const int treeSize = m_data.size() - m_treeOffset;
++    const int count = treeSize / m_nodeSize;
++    // ponytail: 10,000 nodes and depth 64 bound traversal and path storage.
++    // Larger bundles need explicit limits and corresponding stress tests.
++    if (treeSize % m_nodeSize || count < 1 || count > 10000)
++        return false;
++    m_seen = QBitArray(count);
++    return parseTree("", 0, 0) && m_seen.count(true) == count;
+ }
+ 
+-bool ResInfo::parseHeader(const QString &fileName)
++QString ResInfo::nodeName(int offset) const
+ {
+-    // copy-paste from "qtbase/src/corelib/io/qresource.cpp"
+-
+-    // bool QDynamicFileResourceRoot::registerSelf(const QString &f)
+-
+-    if (!m_data) {
+-        QFile file(fileName);
+-        bool ok = false;
+-        if (file.open(QIODevice::ReadOnly)) {
+-            qint64 fsize = file.size();
+-            if (fsize <= std::numeric_limits<qsizetype>::max()) {
+-                m_data_len = file.size();
+-                m_data = new uchar[m_data_len];
+-                ok = (m_data_len == file.read((char*)m_data, m_data_len));
+-            }
+-        }
+-        if (!ok) {
+-            delete [] m_data;
+-            m_data = nullptr;
+-            m_data_len = 0;
++    const int length = m_treeOffset - m_namesOffset;
++    if (!inRange(offset, 6, length))
++        return {};
++    const char *p = m_data.constData() + m_namesOffset + offset;
++    const int count = qFromBigEndian<quint16>(p);
++    if (!count || !inRange(qint64(offset) + 6, qint64(count) * 2, length))
++        return {};
++    QString name(count, Qt::Uninitialized);
++    qFromBigEndian<ushort>(p + 6, count, name.data());
++    if (name == "." || name == ".." || name.contains('/') || name.contains('\\')
++            || name.toUtf8().size() > 255 || QString::fromUtf8(name.toUtf8()) != name)
++        return {};
++    for (QChar c : name) {
++        // XML 1.0 cannot represent these names; reject rather than rename them.
++        if ((c.unicode() < 32 && c != '\t' && c != '\n' && c != '\r')
++                || c.unicode() == 0xfffe || c.unicode() == 0xffff)
++            return {};
++    }
++    return name;
++}
+ 
+-            qInfo() << LOG_MESSAGE_ID << "Failed read file:" << fileName;
++bool ResInfo::parseTree(const QString &dir, int node, int depth)
++{
++    if (depth > 64 || node < 0 || node >= m_seen.size() || m_seen.testBit(node))
++        return false;
++    m_seen.setBit(node);
++    const char *p = m_data.constData() + m_treeOffset + node * m_nodeSize;
++    const QString name = node == 0 ? QString(":") : nodeName(qFromBigEndian<qint32>(p));
++    const QString path = dir + name;
++    if (name.isEmpty() || path.toUtf8().size() > 4096)
++        return false;
++    const quint16 flags = qFromBigEndian<quint16>(p + 4);
++    if (flags == Directory) {
++        if (m_info.contains(path) || m_directories.contains(path))
+             return false;
++        m_directories.insert(path);
++        const int count = qFromBigEndian<qint32>(p + 6);
++        const int first = qFromBigEndian<qint32>(p + 10);
++        if (!inRange(first, count, m_seen.size()))
++            return false;
++        for (int i = 0; i < count; ++i) {
++            if (!parseTree(path + "/", first + i, depth + 1))
++                return false;
+         }
++        return true;
+     }
+-
+-    // bool QDynamicBufferResourceRoot::registerSelf(const uchar *b, qsizetype size)
+-
+-    // 5 int "pointers"
+-    if (m_data_len >= 0 && m_data_len < 20) {
+-        qInfo() << LOG_MESSAGE_ID << "Invalid file (size too small):" << m_data_len << "bytes";
++    if (node == 0 || m_directories.contains(path)
++            || (flags != 0 && flags != Compressed && flags != CompressedZstd)
++            || (flags == CompressedZstd && m_formatVersion < 3))
+         return false;
+-    }
+-
+-    //setup the data now
+-    int offset = 0;
+-
+-    //magic number
+-    if (m_data[offset+0] != 'q' ||
+-        m_data[offset+1] != 'r' ||
+-        m_data[offset+2] != 'e' ||
+-        m_data[offset+3] != 's')
+-    {
+-        qInfo() << LOG_MESSAGE_ID << "Invalid magic value";
++    const int offset = qFromBigEndian<qint32>(p + 10);
++    const int payloadSize = m_namesOffset - m_dataOffset;
++    if (!inRange(offset, 4, payloadSize))
+         return false;
+-    }
+-    offset += 4;
+-
+-    const int version = qFromBigEndian<qint32>(m_data + offset);
+-    offset += 4;
+-
+-    const int tree_offset = qFromBigEndian<qint32>(m_data + offset);
+-    offset += 4;
+-
+-    const int data_offset = qFromBigEndian<qint32>(m_data + offset);
+-    offset += 4;
+-
+-    const int name_offset = qFromBigEndian<qint32>(m_data + offset);
+-    offset += 4;
+-
+-    quint32 file_flags = 0;
+-    if (version >= 3) {
+-        file_flags = qFromBigEndian<qint32>(m_data + offset);
+-        //offset += 4;
+-    }
+-
+-    // Some sanity checking for sizes. This is _not_ a security measure.
+-    if (m_data_len >= 0 && (tree_offset >= m_data_len || data_offset >= m_data_len || name_offset >= m_data_len)) {
+-        qInfo() << LOG_MESSAGE_ID << "Invalid offset value";
++    const int size = qFromBigEndian<qint32>(m_data.constData() + m_dataOffset + offset);
++    if (!inRange(qint64(offset) + 4, size, payloadSize))
+         return false;
++    const ResItem item{qFromBigEndian<quint16>(p + 6), qFromBigEndian<quint16>(p + 8),
++                       flags, size, m_dataOffset + offset + 4};
++    if (item.language < QLocale::C || item.language > QLocale::LastLanguage
++            || item.country > QLocale::LastCountry || dataSize(item) < 0)
++        return false;
++    const QLocale locale(QLocale::Language(item.language), QLocale::Country(item.country));
++    if (locale.language() != item.language
++            || (item.country != QLocale::AnyCountry && locale.country() != item.country))
++        return false;
++    for (const ResItem &previous : m_info.values(path)) {
++        if (previous.language == item.language && previous.country == item.country)
++            return false;
+     }
+-
+-    if (version >= 0x01 && version <= 0x03) {
+-        m_formatVersion = version;
+-        m_flags = file_flags;
+-
+-        m_tree = m_data + tree_offset;
+-        m_names = m_data + name_offset;
+-        m_payloads = m_data + data_offset;
+-
+-        return true;
+-    } else {
+-        qInfo() << LOG_MESSAGE_ID << "Unknown format version:" << version;
+-    }
+-
+-    return false;
++    if (!m_info.contains(path))
++        m_orderedItemNames.append(path);
++    m_info.insert(path, item);
++    return true;
+ }
+ 
+-QString ResInfo::getNodeName(qint32 name_offset) const
++qint64 ResInfo::dataSize(const ResItem &item) const
+ {
+-    const quint16 name_length = qFromBigEndian<qint16>(m_names + name_offset);
+-    name_offset += 2;
+-    name_offset += 4; //jump past hash
+-
+-    QString name;
+-    name.resize(name_length);
+-    QChar *strData = name.data();
+-    qFromBigEndian<ushort>(m_names + name_offset, name_length, strData);
+-
+-    return name;
++    if (!inRange(item.offset, item.size, m_data.size()))
++        return -1;
++    const char *p = m_data.constData() + item.offset;
++    quint64 size = item.size;
++    if (item.flags == Compressed) {
++        if (item.size < 4)
++            return -1;
++        size = qFromBigEndian<quint32>(p);
++    } else if (item.flags == CompressedZstd) {
++        size = ZSTD_getFrameContentSize(p, item.size);
++        if (ZSTD_findFrameCompressedSize(p, item.size) != size_t(item.size))
++            return -1;
++    }
++    return size <= quint64(MaxBytes) ? qint64(size) : -1;
+ }
+ 
+-bool ResInfo::parseTree(const QString &dir, const int nodeOffset)
++bool ResInfo::readData(const ResItem &item, QByteArray &out) const
+ {
+-    int offset = nodeOffset;
+-
+-    const qint32 name_offset = qFromBigEndian<qint32>(m_tree + offset);
+-    offset += 4;
+-
+-    // first node is "root"
+-    QString name = (nodeOffset == 0) ? ":" : getNodeName(name_offset);
+-
+-    const qint16 flags = qFromBigEndian<qint16>(m_tree + offset);
+-    offset += 2;
+-
+-    if ( flags & Flags::Directory ) {
+-        // Directory
+-        const qint32 child_count = qFromBigEndian<qint32>(m_tree + offset);
+-        offset += 4;
+-
+-        //qDebug() << LOG_MESSAGE_ID << name << "(childs count:" << child_count << ")";
+-
+-        const qint32 first_child_offset = qFromBigEndian<qint32>(m_tree + offset);
+-        //offset += 4;
+-
+-        const int node_size = 14 + (m_formatVersion >= 0x02 ? 8 : 0);
+-
+-        for (int i = 0; i < child_count; ++i) {
+-            // recursion
+-            if ( !parseTree(dir + name + "/", (first_child_offset + i) * node_size) ) {
+-                return false;
+-            }
+-        }
++    const qint64 size = dataSize(item);
++    if (size < 0)
++        return false;
++    const char *p = m_data.constData() + item.offset;
++    out.resize(qMax<qint64>(1, size));
++    if (item.flags == Compressed) {
++        uLongf written = out.size();
++        uLong consumed = item.size - 4;
++        if (uncompress2(reinterpret_cast<Bytef *>(out.data()), &written,
++                        reinterpret_cast<const Bytef *>(p + 4), &consumed) != Z_OK
++                || written != quint64(size) || consumed != quint64(item.size - 4))
++            return false;
++    } else if (item.flags == CompressedZstd) {
++        const size_t written = ZSTD_decompress(out.data(), out.size(), p, item.size);
++        if (ZSTD_isError(written) || written != quint64(size))
++            return false;
+     } else {
+-        // Single file
+-        const qint16 country = qFromBigEndian<qint16>(m_tree + offset);
+-        offset += 2;
+-
+-        const qint16 language = qFromBigEndian<qint16>(m_tree + offset);
+-        offset += 2;
+-
+-        qint32 data_offset = qFromBigEndian<qint32>(m_tree + offset);
+-        offset += 4;
+-
+-        quint64 last_modified = 0;
+-        if (m_formatVersion >= 2) {
+-            last_modified = qFromBigEndian<quint64>(m_tree + offset);
+-            //offset += 8;
+-        }
+-
+-        const qint32 data_size = qFromBigEndian<qint32>(m_payloads + data_offset);
+-        data_offset += 4;
+-
+-        // absolute offset
+-        data_offset += m_payloads - m_data;
+-
+-        name = dir + name;
+-
+-        if (!m_info.contains(name)) {
+-            m_orderedItemNames.append(name);
+-        }
+-
+-        const ResItem item{
+-            country,
+-            language,
+-            flags,
+-            last_modified,
+-            data_size,
+-            data_offset
+-        };
+-
+-        m_info.insert(name, item);
+-
+-        //qDebug() << LOG_MESSAGE_ID << name << item;
++        out = QByteArray(p, item.size);
+     }
+-
++    out.resize(size);
+     return true;
+ }
+--- a/src/resinfo.h
++++ b/src/resinfo.h
+@@ -1,78 +1,52 @@
+ // SPDX-License-Identifier: GPL-3.0-only WITH Qt-GPL-exception-1.0
+ // Copyright (c) 2020 zed
+ 
+ #ifndef RESINFO_H
+ #define RESINFO_H
+ 
+-#include <QDebug>
+-#include <QFile>
+-#include <QString>
++#include <QBitArray>
++#include <QByteArray>
++#include <QMultiHash>
++#include <QSet>
++#include <QStringList>
+ 
+ struct ResItem
+ {
+-    qint16 country;
+-    qint16 language;
+-    qint32 flags;
+-    quint64 last_modified;
+-    qint32 size;
+-    qint32 offset;
+-
+-    friend QDebug operator<< (QDebug stream, const ResItem &item)
+-    {
+-        stream << "ResItem("
+-               << "country: " << item.country << ", "
+-               << "language: " << item.language << ", "
+-               << "flags: " << item.flags << ", "
+-               << "last-modified: " << item.last_modified << ", "
+-               << "size: " << item.size << ", "
+-               << "offset: " << item.offset
+-               << ")";
+-        return stream;
+-    }
++    quint16 country;
++    quint16 language;
++    quint16 flags;
++    int size;
++    int offset;
+ };
+ 
+ class ResInfo
+ {
+ public:
+-    enum Flags
+-    {
+-        // must match rcc.h
+-        Compressed = 0x01,
+-        Directory = 0x02,
+-        CompressedZstd = 0x04
+-    };
+-
+-    explicit ResInfo();
+-    ~ResInfo();
+-
++    enum Flags { Compressed = 1, Directory = 2, CompressedZstd = 4 };
++    // ponytail: bounded desktop assets, not arbitrary-size archives. Raise these
++    // ceilings only with memory/CPU tests or a streaming decoder implementation.
++    static constexpr qint64 MaxBytes = 64 * 1024 * 1024;
+     bool read(const QString &fileName);
+-
+-    QList<ResItem> getInfo(const QString &itemName) const;
+-    const QList<QString> getItemNames() const;
+-    int getItemsCount() const;
+-    int getFormatVersion() const;
+-    int getFlags() const;
+-
+-private:
+-    void clear();
+-
+-    bool parseHeader(const QString &fileName);
+-    bool parseTree(const QString &dir, const int nodeOffset);
+-
+-    QString getNodeName(qint32 name_offset) const;
++    QList<ResItem> getInfo(const QString &name) const { return m_info.values(name); }
++    QStringList getItemNames() const { return m_orderedItemNames; }
++    int getFormatVersion() const { return m_formatVersion; }
++    int nodeCount() const { return m_seen.size(); }
++    qint64 dataSize(const ResItem &item) const;
++    bool readData(const ResItem &item, QByteArray &out) const;
+ 
+ private:
++    bool parseTree(const QString &dir, int node, int depth);
++    QString nodeName(int offset) const;
++    QByteArray m_data;
+     QMultiHash<QString, ResItem> m_info;
+-    QList<QString> m_orderedItemNames;
+-
+-    uchar *m_data = nullptr;
+-    qsizetype m_data_len = 0;
+-
++    QStringList m_orderedItemNames;
++    QSet<QString> m_directories;
++    QBitArray m_seen;
+     int m_formatVersion = 0;
+-    int m_flags = 0;
+-    const uchar *m_tree = nullptr;
+-    const uchar *m_names = nullptr;
+-    const uchar *m_payloads = nullptr;    
++    int m_treeOffset = 0;
++    int m_namesOffset = 0;
++    int m_dataOffset = 0;
++    int m_nodeSize = 0;
+ };
+ 
+-#endif // RESINFO_H
++#endif

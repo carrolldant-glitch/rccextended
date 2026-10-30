@@ -1,0 +1,6 @@
+/verification/
+/src/
+/pkg/
+/*.pkg.tar.*
+/*.tar.gz
+/rccextended-*-license.patch
